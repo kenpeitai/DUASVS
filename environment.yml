@@ -1,0 +1,16 @@
+name: DUASVS
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy>=1.24
+  - pandas>=2.0
+  - pytorch>=2.1
+  - cpuonly
+  - pip:
+      - gymnasium>=0.29
+      - tqdm>=4.66
+
+

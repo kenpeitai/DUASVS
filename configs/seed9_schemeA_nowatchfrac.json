@@ -1,0 +1,47 @@
+{
+  "name": "seed9_schemeA_nowatchfrac_baseline",
+  "notes": "Baseline config used for comparisons. Matches run_name=official_seed9_patience10_schemeA_rebuf4_waste0p5_lr2e4_ent0p025_NOwatchfrac.",
+  "train_script": "train_duasvs_ppo.py",
+  "mode": "official",
+  "seed": 9,
+  "device": "cuda",
+  "total_steps": 400000,
+  "max_rebuf_s_per_video": 10,
+  "rebuf_penalty_mode": "linear",
+  "rebuf_penalty": 4.0,
+  "switch_penalty": 1.0,
+  "lambda_waste": 0.5,
+  "r_min_mbps": 0.2,
+  "no_qoe_scale_by_watch_frac": true,
+  "ppo": {
+    "lr": 0.0002,
+    "ent_coef": 0.025,
+    "clip_ratio": 0.1,
+    "train_iters": 5,
+    "batch_size": 256,
+    "gamma": 0.99,
+    "lam": 0.95,
+    "vf_coef": 0.5
+  },
+  "action_space_defaults": {
+    "bitrates_mbps": [0.35, 0.7, 1.2, 2.5, 5.0],
+    "bitrate_labels": ["180p", "360p", "480p", "720p", "1080p"],
+    "prefetch_thresholds_s": [1, 2, 4, 6, 8, 12, 18, 24, 30, 36]
+  },
+  "data_defaults": {
+    "events_csv": "data/big_matrix_valid_video.csv",
+    "traces_csv": "data/fcc_httpgetmt_trace_1s_kbps.csv",
+    "trace_ids_file": "splits/fcc_train_trace_ids.txt",
+    "eval_ids_file": "splits/fcc_val_trace_ids.txt"
+  },
+  "eval_defaults_official": {
+    "eval_every_updates": 1,
+    "eval_n_traces": 50,
+    "eval_select_mode": "head",
+    "eval_max_videos": 200,
+    "selected_eval_trace_ids_file": "checkpoints/official_seed9_patience10_schemeA_rebuf4_waste0p5_lr2e4_ent0p025_NOwatchfrac_eval_trace_ids_selected.txt"
+  },
+  "run_name": "official_seed9_patience10_schemeA_rebuf4_waste0p5_lr2e4_ent0p025_NOwatchfrac"
+}
+
+

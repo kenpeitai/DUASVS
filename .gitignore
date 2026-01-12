@@ -1,0 +1,30 @@
+############################
+# Artifacts / checkpoints
+############################
+checkpoints/
+
+############################
+# Python
+############################
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+############################
+# Virtual env
+############################
+.venv/
+venv/
+ENV/
+
+############################
+# Outputs (generated)
+############################
+eval_outputs/
+
+############################
+# Data (large / generated)
+############################
+data/big_matrix_valid_video.csv
