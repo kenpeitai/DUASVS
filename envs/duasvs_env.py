@@ -342,25 +342,30 @@ class DUASVSEnv(gym.Env):
             bw_multiplier=float(config.get("trace_bw_multiplier", 1.0)),
             allowed_trace_ids=config.get("allowed_trace_ids", None),
         )
+        # When the current trace is exhausted during simulation:
+        # - "truncate": stop simulation and truncate episode when trace ends (old behavior)
+        # - "next":     switch to another trace and continue the episode
+        # - "drop_video": if trace ends mid-video, discard THIS video (no reward/metrics update) and truncate episode
+        self.trace_exhaust_mode: str = str(config.get("trace_exhaust_mode", "drop_video")).strip().lower()
+        if self.trace_exhaust_mode not in {"truncate", "next", "drop_video"}:
+            raise ValueError("trace_exhaust_mode must be one of: truncate, next, drop_video")
 
         # --- bitrate ladder ---
-        # Default ladder mapped to common short-video resolutions (CBR proxy, Mbps):
-        #   180p, 360p, 480p, 720p, 1080p
-        # (Avoids overly high 2k bitrate which is uncommon for short-form feeds.)
-        # Added 180p as a low-bitrate action to improve robustness under poor throughput.
-        self.video_bitrates_mbps: List[float] = list(map(float, config.get("video_bitrates_mbps", [0.35, 0.7, 1.2, 2.5, 5.0])))
+        # Expanded ladder with intermediate steps for smoother control (Mbps):
+        #   180p, 270p, 360p, 480p, 720p, 1080p, 1440p
+        self.video_bitrates_mbps: List[float] = list(map(float, config.get("video_bitrates_mbps", [0.35, 0.6, 0.9, 1.2, 1.8, 2.5, 4.0])))
         if len(self.video_bitrates_mbps) <= 0:
             raise ValueError("video_bitrates_mbps must be non-empty.")
-        self.video_bitrate_labels: List[str] = list(map(str, config.get("video_bitrate_labels", ["180p", "360p", "480p", "720p", "1080p"])))
+        self.video_bitrate_labels: List[str] = list(map(str, config.get("video_bitrate_labels", ["180p", "270p", "360p", "480p", "720p", "1080p", "1440p"])))
         if len(self.video_bitrate_labels) != len(self.video_bitrates_mbps):
             raise ValueError("video_bitrate_labels length must match video_bitrates_mbps length.")
 
         # --- Joint action: (bitrate, prefetch_threshold) ---
         # DUASVS semantics: prefetch_threshold (seconds) caps the allowed *unplayed buffer* ahead of playback.
-        # Default thresholds calibrated to KuaiRec watch-time stats (seconds), with a slightly larger action range:
-        # covers short watches (~1-4s), typical (~6-12s), and tail (~18s).
-        # Extended action range with longer thresholds for ablations: 24, 30, 36.
-        self.prefetch_thresholds_s: List[float] = list(map(float, config.get("prefetch_thresholds_s", [1, 2, 4, 6, 8, 12, 18, 24, 30, 36])))
+        # Expanded thresholds with intermediate values (seconds).
+        self.prefetch_thresholds_s: List[float] = list(
+            map(float, config.get("prefetch_thresholds_s", [1, 3, 6, 10, 16, 30]))
+        )
         if len(self.prefetch_thresholds_s) <= 0:
             raise ValueError("prefetch_thresholds_s must be non-empty.")
         if any(x < 0 for x in self.prefetch_thresholds_s):
@@ -383,11 +388,14 @@ class DUASVSEnv(gym.Env):
         # --- user patience (short-video realism) ---
         # If rebuffering accumulates beyond this cap (seconds) within a single video,
         # the user is assumed to swipe away (stop watching), preventing unbounded stall time.
-        self.max_rebuf_s_per_video: float = float(config.get("max_rebuf_s_per_video", 8.0))
+        # User patience cap within a single video.
+        # Set <=0 for "infinite patience" (never swipe due to rebuffer).
+        _mrv = float(config.get("max_rebuf_s_per_video", 0.0))
+        self.max_rebuf_s_per_video: float = (1e18 if _mrv <= 0 else float(_mrv))
 
         # --- reward params (doc-style) ---
-        self.r_min_mbps: float = float(config.get("r_min_mbps", 0.2))
-        self.rebuf_penalty: float = float(config.get("rebuf_penalty", 2.66))
+        self.r_min_mbps: float = float(config.get("r_min_mbps", 0.35))
+        self.rebuf_penalty: float = float(config.get("rebuf_penalty", 1.0))
         # Bitrate utility scaling:
         # If True (default), scale bitrate utility by watched fraction (played_s / watch_s) for short-video realism.
         # If False, any non-zero playback grants the full bitrate utility (paper may implicitly do this).
@@ -400,8 +408,14 @@ class DUASVSEnv(gym.Env):
         self.rebuf_penalty_mode: str = str(config.get("rebuf_penalty_mode", "linear")).lower()
         self.rebuf_cap_s: float = float(config.get("rebuf_cap_s", 12.0))
         self.rebuf_log_scale_s: float = float(config.get("rebuf_log_scale_s", 2.0))
-        self.switch_penalty: float = float(config.get("switch_penalty", 1.0))
+        self.switch_penalty: float = float(config.get("switch_penalty", 0.1))
         self.lambda_waste: float = float(config.get("lambda_waste", 0.5))
+        # Waste penalty shaping: soft saturating transform on raw waste ratio.
+        # waste_ratio = 1 - exp(-k * raw), raw = waste_mbit / max(downloaded_mbit, eps)
+        self.waste_saturate_k: float = float(config.get("waste_saturate_k", 1.0))
+        # Whether to allow cross-video prefetch (download FUTURE videos after CURRENT is fully downloaded).
+        # Default: disabled.
+        self.allow_future_prefetch: bool = bool(config.get("allow_future_prefetch", False))
 
         # RNG
         self._rng = np.random.default_rng(int(config.get("seed", 0)))
@@ -434,6 +448,7 @@ class DUASVSEnv(gym.Env):
         self.trace_id: Optional[str] = None
         self.trace_bw_mbps: Optional[np.ndarray] = None
         self.t: int = 0  # seconds index into trace
+        self.trace_switches_total: int = 0
         self.buffer_s: float = 0.0
         self.prev_bitrate_idx: int = 0
         self.session: List[VideoEvent] = []
@@ -474,6 +489,11 @@ class DUASVSEnv(gym.Env):
         bw_kbps = self.trace_pool.traces[tid]
         self.trace_bw_mbps = (bw_kbps.astype(np.float32) / 1000.0)
         self.t = 0
+
+    def _advance_trace(self) -> None:
+        """Switch to another trace and reset time index (used when trace_exhaust_mode='next')."""
+        self._pick_trace(first_trace_id=None)
+        self.trace_switches_total += 1
 
     def _get_bw_hist_norm(self) -> np.ndarray:
         assert self.trace_bw_mbps is not None
@@ -523,6 +543,7 @@ class DUASVSEnv(gym.Env):
             first_tid = str(options.get("first_trace_id"))
 
         self._pick_trace(first_trace_id=first_tid)
+        self.trace_switches_total = 0
         self.session = self.session_sampler.sample_session()
         self.i = 0
         self.buffer_s = 0.0
@@ -574,7 +595,7 @@ class DUASVSEnv(gym.Env):
         watch_s: float,
         bitrate_mbps: float,
         prefetch_s: float,
-    ) -> Tuple[float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float, float, bool]:
         """
         Simulate download/playback for ONE video under a buffer-threshold prefetch policy.
 
@@ -583,7 +604,8 @@ class DUASVSEnv(gym.Env):
           - Else => pause download this 1s slot.
 
         Returns:
-          (download_time_s, rebuffer_s, downloaded_s, played_s)
+          (download_time_s, rebuffer_s, downloaded_s, played_s,
+           waste_cur_s, downloaded_cur_new_s, downloaded_future_new_s, swiped_due_to_rebuf)
         """
         assert self.trace_bw_mbps is not None
 
@@ -600,8 +622,17 @@ class DUASVSEnv(gym.Env):
         downloaded_cur_new = 0.0
         downloaded_future_new = 0.0
 
-        # Simulate in 1s slots until user stops watching or trace ends (1Hz)
-        while played_s < watch_s - 1e-9 and self.t < len(self.trace_bw_mbps):
+        # Simulate in 1s slots until user stops watching.
+        # If the trace is exhausted:
+        # - trace_exhaust_mode="truncate": stop simulation (episode will be truncated)
+        # - trace_exhaust_mode="next": switch to another trace and continue simulation
+        # - trace_exhaust_mode="drop_video": stop simulation; caller may discard this video and truncate episode
+        while played_s < watch_s - 1e-9:
+            if self.t >= len(self.trace_bw_mbps):
+                if str(self.trace_exhaust_mode).lower() == "next":
+                    self._advance_trace()
+                else:
+                    break
             # 1) Decide whether to download this slot.
             #    IMPORTANT (DUASVS semantics, option A):
             #    - Always prioritize keeping CURRENT video's buffer under the threshold to avoid deadlocks.
@@ -611,7 +642,7 @@ class DUASVSEnv(gym.Env):
             cur_fully_downloaded = bool(downloaded_cur_total >= video_len_s - 1e-9)
             do_download_cur = bool((not cur_fully_downloaded) and (buf_cur < prefetch_s - 1e-9))
             total_buf = self._buffer_ahead_s(self.i, buf_cur)
-            do_download_future = bool(cur_fully_downloaded and (total_buf < prefetch_s - 1e-9))
+            do_download_future = bool(self.allow_future_prefetch and cur_fully_downloaded and (total_buf < prefetch_s - 1e-9))
             do_download = bool(do_download_cur or do_download_future)
 
             if do_download:
@@ -698,6 +729,29 @@ class DUASVSEnv(gym.Env):
             raise RuntimeError("Episode is done; call reset().")
         assert self.trace_bw_mbps is not None
 
+        mode_trace = str(getattr(self, "trace_exhaust_mode", "truncate")).lower()
+        # In drop_video mode, if trace ends mid-video we discard this step's effects.
+        # Snapshot mutable state so we can rollback cleanly.
+        if mode_trace == "drop_video":
+            _snap = {
+                "t": int(self.t),
+                "trace_id": self.trace_id,
+                "trace_bw_mbps": self.trace_bw_mbps,  # reference; should not be mutated
+                "buffer_s": float(self.buffer_s),
+                "prev_bitrate_idx": int(self.prev_bitrate_idx),
+                "i": int(self.i),
+                "prefetched_unplayed_s": list(self.prefetched_unplayed_s),
+                "prefetched_bitrate_idx": list(self.prefetched_bitrate_idx),
+                "sum_rebuf_s": float(self.sum_rebuf_s),
+                "sum_waste_s": float(self.sum_waste_s),
+                "sum_qoe": float(self.sum_qoe),
+                "sum_downloaded_mbit": float(self.sum_downloaded_mbit),
+                "sum_waste_mbit": float(self.sum_waste_mbit),
+                "last_prefetch_s": float(self.last_prefetch_s),
+            }
+        else:
+            _snap = None
+
         bitrate_idx, prefetch_idx = self._decode_action(int(action))
         prefetch_s = float(self.prefetch_thresholds_s[prefetch_idx])
         self.last_prefetch_s = prefetch_s
@@ -727,6 +781,44 @@ class DUASVSEnv(gym.Env):
             bitrate_mbps=bitrate_mbps,
             prefetch_s=prefetch_s,
         )
+
+        # If trace ended mid-video and mode is drop_video:
+        # discard THIS video and remaining trace, and truncate episode (no reward/metrics update).
+        if mode_trace == "drop_video":
+            trace_exhausted = bool(self.t >= len(self.trace_bw_mbps))
+            video_incomplete = bool(float(played_s) < float(watch_s) - 1e-9)
+            if trace_exhausted and video_incomplete and (not bool(swiped_due_to_rebuf)):
+                assert _snap is not None
+                # Rollback all side-effects from this step.
+                self.trace_id = _snap["trace_id"]
+                self.trace_bw_mbps = _snap["trace_bw_mbps"]
+                self.buffer_s = float(_snap["buffer_s"])
+                self.prev_bitrate_idx = int(_snap["prev_bitrate_idx"])
+                self.i = int(_snap["i"])
+                self.prefetched_unplayed_s = list(_snap["prefetched_unplayed_s"])
+                self.prefetched_bitrate_idx = list(_snap["prefetched_bitrate_idx"])
+                self.sum_rebuf_s = float(_snap["sum_rebuf_s"])
+                self.sum_waste_s = float(_snap["sum_waste_s"])
+                self.sum_qoe = float(_snap["sum_qoe"])
+                self.sum_downloaded_mbit = float(_snap["sum_downloaded_mbit"])
+                self.sum_waste_mbit = float(_snap["sum_waste_mbit"])
+                self.last_prefetch_s = float(_snap["last_prefetch_s"])
+
+                # Discard remaining trace and end episode
+                self.t = int(len(self.trace_bw_mbps))
+                obs = np.zeros(self.observation_space.shape, dtype=np.float32)
+                info = {
+                    "trace_id": self.trace_id,
+                    "t": int(self.t),
+                    "video_idx": int(self.i),
+                    "dropped_video_due_to_trace_end": True,
+                    "sum_rebuf_s": float(self.sum_rebuf_s),
+                    "sum_waste_s": float(self.sum_waste_s),
+                    "sum_qoe": float(self.sum_qoe),
+                    "sum_downloaded_mbit": float(self.sum_downloaded_mbit),
+                    "sum_waste_mbit": float(self.sum_waste_mbit),
+                }
+                return obs, 0.0, False, True, info
         self.sum_rebuf_s += float(rebuf_s)
 
         # Waste is downloaded-but-unwatched seconds of THIS video when user scrolls away, plus any discarded prefetch.
@@ -743,7 +835,8 @@ class DUASVSEnv(gym.Env):
         r_min = max(float(self.eps_mbps), float(self.r_min_mbps))
         # Bitrate utility: optionally scale by how much the user actually watched (short-video realism).
         if bool(self.qoe_scale_by_watch_frac):
-            watched_frac = float(played_s / max(float(self.eps_mbps), float(watch_s)))
+            # NOTE: watch_s is in seconds; do NOT use eps_mbps here (unit mismatch).
+            watched_frac = float(played_s / max(1e-9, float(watch_s)))
             watched_frac = float(np.clip(watched_frac, 0.0, 1.0))
         else:
             # If the user watched anything (played_s > 0), grant full utility.
@@ -769,12 +862,25 @@ class DUASVSEnv(gym.Env):
         self.sum_qoe += qoe
 
         # Penalize wasted DATA volume (Mbit), not wasted seconds.
-        reward = float(qoe - self.lambda_waste * waste_mbit)
+        # Normalize by downloaded/wasted to avoid explosion when downloaded_mbit is tiny.
+        # waste_ratio: denominator floor + clip to avoid reward explosions when downloaded_mbit is tiny.
+        # Note: We intentionally do NOT include waste_mbit in the denominator here; instead we clip the ratio.
+        denom = float(max(downloaded_mbit, 1e-9))
+        raw = float(max(0.0, waste_mbit / denom))
+        k = float(max(1e-9, float(self.waste_saturate_k)))
+        # Soft saturating in [0, 1): avoids hard clipping while still bounding the penalty.
+        waste_ratio = float(1.0 - np.exp(-k * raw))
+        reward = float(qoe - self.lambda_waste * waste_ratio)
 
         self.i += 1
 
         terminated = (self.i >= len(self.session))
-        truncated = bool(self.t >= len(self.trace_bw_mbps))
+        # - next: trace exhaustion handled by switching traces, so no truncation from trace end
+        # - truncate/drop_video: trace end truncates episode (drop_video handles mid-video separately above)
+        if mode_trace == "next":
+            truncated = False
+        else:
+            truncated = bool(self.t >= len(self.trace_bw_mbps))
 
         # Update session-level buffer state (seconds ahead for remaining videos).
         if not (terminated or truncated):
@@ -814,6 +920,11 @@ class DUASVSEnv(gym.Env):
             "swiped_due_to_rebuf": bool(swiped_due_to_rebuf),
             "downloaded_mbit": float(downloaded_mbit),
             "waste_mbit": float(waste_mbit),
+            # For debugging / eval diagnostics of waste shaping:
+            # raw = waste_mbit / max(downloaded_mbit, eps)
+            # waste_ratio = 1 - exp(-k * raw)   (soft saturating)
+            "waste_raw": float(raw),
+            "waste_ratio": float(waste_ratio),
             "sum_rebuf_s": float(self.sum_rebuf_s),
             "sum_waste_s": float(self.sum_waste_s),
             "sum_qoe": float(self.sum_qoe),

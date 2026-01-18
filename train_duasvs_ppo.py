@@ -33,7 +33,7 @@ def set_seed(seed: int):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int):
+    def __init__(self, obs_dim: int, act_dim: int, *, logits_clip: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, 128),
@@ -43,10 +43,16 @@ class ActorCritic(nn.Module):
         )
         self.pi = nn.Linear(128, act_dim)
         self.v = nn.Linear(128, 1)
+        self.logits_clip = float(logits_clip)
 
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.net(obs)
-        return self.pi(x), self.v(x).squeeze(-1)
+        logits = self.pi(x)
+        # Optional numerics guard: extremely large logits can create inf/nan in downstream ops.
+        # (torch's categorical is usually stable, but this helps when policies become very peaky.)
+        if float(self.logits_clip) > 0.0:
+            logits = torch.clamp(logits, -float(self.logits_clip), float(self.logits_clip))
+        return logits, self.v(x).squeeze(-1)
 
     def act(self, obs: torch.Tensor):
         logits, v = self.forward(obs)
@@ -114,9 +120,11 @@ def ppo_update(
     clip_ratio: float,
     vf_coef: float,
     ent_coef: float,
+    uniform_kl_coef: float,
     target_kl: Optional[float],
     train_iters: int,
     batch_size: int,
+    debug_numerics: bool = False,
 ):
     n = obs.shape[0]
     stats_sum = {
@@ -133,6 +141,11 @@ def ppo_update(
         for start in range(0, n, int(batch_size)):
             mb = idx[start : start + int(batch_size)]
             logits, v = model.forward(obs[mb])
+            if bool(debug_numerics):
+                if not torch.isfinite(logits).all():
+                    raise FloatingPointError("Non-finite policy logits detected.")
+                if not torch.isfinite(v).all():
+                    raise FloatingPointError("Non-finite value predictions detected.")
             dist = torch.distributions.Categorical(logits=logits)
             logp = dist.log_prob(acts[mb])
             ratio = torch.exp(logp - logp_old[mb])
@@ -142,6 +155,13 @@ def ppo_update(
             vf_loss = (ret[mb] - v).pow(2).mean()
             ent = dist.entropy().mean()
             loss = pi_loss + vf_coef * vf_loss - ent_coef * ent
+            if float(uniform_kl_coef) > 0.0:
+                # Penalize KL(pi || uniform) to encourage action spread.
+                uniform_dist = torch.distributions.Categorical(logits=torch.zeros_like(logits))
+                kl_uniform = torch.distributions.kl_divergence(dist, uniform_dist).mean()
+                loss = loss + float(uniform_kl_coef) * kl_uniform
+            if bool(debug_numerics) and (not torch.isfinite(loss)):
+                raise FloatingPointError("Non-finite PPO loss detected.")
 
             # PPO diagnostics (SB3-style)
             # approx_kl estimates KL(old||new) for samples drawn from old policy.
@@ -158,6 +178,12 @@ def ppo_update(
 
             opt.zero_grad()
             loss.backward()
+            if bool(debug_numerics):
+                for p in model.parameters():
+                    if p.grad is None:
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        raise FloatingPointError("Non-finite gradients detected.")
             opt.step()
 
             # Target-KL early stop to reduce policy drift / oscillation.
@@ -215,6 +241,9 @@ def eval_on_traces(
     ep_waste_s: List[float] = []
     ep_dl_mbit: List[float] = []
     ep_waste_mbit: List[float] = []
+    # Per-step diagnostic distributions (across all eval steps).
+    waste_raw_steps: List[float] = []
+    waste_ratio_steps: List[float] = []
 
     # Key perf optimization:
     # Reuse a single env across all trace_ids to avoid repeatedly parsing large FCC CSVs.
@@ -239,6 +268,13 @@ def eval_on_traces(
             obs, r, terminated, truncated, last_info = env_i.step(a)
             ep_ret += float(r)
             ep_len += 1
+            if isinstance(last_info, dict):
+                wr = last_info.get("waste_raw", None)
+                wz = last_info.get("waste_ratio", None)
+                if wr is not None and np.isfinite(float(wr)):
+                    waste_raw_steps.append(float(wr))
+                if wz is not None and np.isfinite(float(wz)):
+                    waste_ratio_steps.append(float(wz))
         ep_returns.append(float(ep_ret))
         ep_lens.append(int(ep_len))
         if isinstance(last_info, dict):
@@ -256,6 +292,19 @@ def eval_on_traces(
     dl_mbit_ps = float(np.mean([ep_dl_mbit[i] / max(1, ep_lens[i]) for i in range(len(ep_dl_mbit))])) if ep_dl_mbit else float("nan")
     waste_mbit_ps = float(np.mean([ep_waste_mbit[i] / max(1, ep_lens[i]) for i in range(len(ep_waste_mbit))])) if ep_waste_mbit else float("nan")
 
+    def _stats(xs: List[float]) -> Dict[str, float]:
+        if not xs:
+            return {"mean": float("nan"), "p50": float("nan"), "p90": float("nan")}
+        a = np.asarray(xs, dtype=float)
+        return {
+            "mean": float(np.mean(a)),
+            "p50": float(np.quantile(a, 0.50)),
+            "p90": float(np.quantile(a, 0.90)),
+        }
+
+    raw_s = _stats(waste_raw_steps)
+    ratio_s = _stats(waste_ratio_steps)
+
     return {
         "n_eps": float(len(ep_returns)),
         "ep_return_mean": float(np.mean(ep_returns)),
@@ -265,6 +314,13 @@ def eval_on_traces(
         "waste_s_per_step": waste_s_ps,
         "downloaded_mbit_per_step": dl_mbit_ps,
         "waste_mbit_per_step": waste_mbit_ps,
+        # Waste shaping diagnostics (per-step distribution on eval set)
+        "waste_raw_mean": raw_s["mean"],
+        "waste_raw_p50": raw_s["p50"],
+        "waste_raw_p90": raw_s["p90"],
+        "waste_ratio_mean": ratio_s["mean"],
+        "waste_ratio_p50": ratio_s["p50"],
+        "waste_ratio_p90": ratio_s["p90"],
     }
 
 
@@ -276,6 +332,7 @@ def rollout_steps(
     *,
     global_steps_before: int,
     update_idx: int,
+    action_mode: str = "sample",
 ) -> Tuple[Rollout, Dict[str, float], List[EpisodeLog]]:
     obs_list: List[np.ndarray] = []
     act_list: List[int] = []
@@ -291,15 +348,38 @@ def rollout_steps(
     sum_waste = 0.0
     ep_logs: List[EpisodeLog] = []
 
+    action_mode_n = str(action_mode).strip().lower()
+    if action_mode_n not in {"sample", "greedy"}:
+        raise ValueError(f"rollout action_mode must be 'sample' or 'greedy'. Got: {action_mode}")
+
     obs, _ = env.reset()
     for _ in range(int(steps)):
+        # Optional strict checks (enabled via env.debug_checks)
+        if bool(getattr(env, "debug_checks", False)):
+            if not np.isfinite(obs).all():
+                raise FloatingPointError("Non-finite observation detected before action selection.")
         obs_t = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
-            a, logp, v = model.act(obs_t)
+            logits, v = model.forward(obs_t)
+            dist = torch.distributions.Categorical(logits=logits)
+            if action_mode_n == "greedy":
+                a = torch.argmax(logits, dim=-1)
+            else:
+                a = dist.sample()
+            logp = dist.log_prob(a)
         a_i = int(a.item())
 
         next_obs, rew, terminated, truncated, info = env.step(a_i)
         done = bool(terminated or truncated)
+        if bool(getattr(env, "debug_checks", False)):
+            if not np.isfinite(float(rew)):
+                raise FloatingPointError(f"Non-finite reward detected: {rew}")
+            if not np.isfinite(next_obs).all():
+                raise FloatingPointError("Non-finite observation detected after env.step().")
+            if not np.isfinite(float(v.item())):
+                raise FloatingPointError("Non-finite value prediction detected.")
+            if not np.isfinite(float(logp.item())):
+                raise FloatingPointError("Non-finite log-prob detected.")
 
         obs_list.append(obs.astype(np.float32))
         act_list.append(a_i)
@@ -367,9 +447,9 @@ def main():
     p.add_argument("--rollout_steps", type=int, default=2048)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--lam", type=float, default=0.95)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", type=float, default=1e-5)
     p.add_argument("--train_iters", type=int, default=10)
-    p.add_argument("--batch_size", type=int, default=256)
+    p.add_argument("--batch_size", type=int, default=2048)
     p.add_argument("--clip_ratio", type=float, default=0.2)
     p.add_argument(
         "--target_kl",
@@ -380,6 +460,39 @@ def main():
     )
     p.add_argument("--vf_coef", type=float, default=0.5)
     p.add_argument("--ent_coef", type=float, default=0.01)
+    p.add_argument(
+        "--ent_coef_end",
+        type=float,
+        default=None,
+        help="If set with --ent_anneal_steps, linearly anneal ent_coef to this value.",
+    )
+    p.add_argument(
+        "--ent_coef_min",
+        type=float,
+        default=None,
+        help="If set, ent_coef will not go below this value after annealing.",
+    )
+    p.add_argument(
+        "--ent_anneal_steps",
+        type=int,
+        default=0,
+        help="Linear anneal steps for ent_coef (0 to disable).",
+    )
+    p.add_argument(
+        "--uniform_kl_coef",
+        type=float,
+        default=0.0,
+        help="Coefficient for KL(pi || uniform) regularization. Set >0 to enable.",
+    )
+    p.add_argument("--logits_clip", type=float, default=0.0, help="Clamp policy logits to [-logits_clip, +logits_clip]. Set <=0 to disable.")
+    p.add_argument(
+        "--rollout_action_mode",
+        type=str,
+        default="sample",
+        choices=["sample", "greedy"],
+        help="Action selection for rollout collection.",
+    )
+    p.add_argument("--debug_numerics", action="store_true", help="Enable strict finite checks for env obs/reward and PPO tensors (raises on NaN/inf).")
 
     # env/data
     p.add_argument("--events_csv", type=str, default="data/big_matrix_valid_video.csv")
@@ -390,12 +503,38 @@ def main():
     p.add_argument("--weight_by_views", action="store_true", help="(video_index mode) sample videos weighted by n_views.")
     p.add_argument("--no_weight_by_views", action="store_true", help="(video_index mode) disable n_views weighting.")
     p.add_argument("--traces_csv", type=str, default="data/fcc_httpgetmt_trace_1s_kbps.csv")
+    p.add_argument("--trace_id_col", type=str, default="trace_id")
+    p.add_argument("--trace_time_col", type=str, default="t")
+    p.add_argument("--trace_bw_col", type=str, default="throughput_kbps")
+    p.add_argument("--trace_bw_multiplier", type=float, default=1.0)
+    p.add_argument("--trace_fill_mode", type=str, default="ffill", choices=["ffill", "zero", "hold"])
+    p.add_argument(
+        "--trace_exhaust_mode",
+        type=str,
+        default="drop_video",
+        choices=["truncate", "next", "drop_video"],
+        help="What to do when current trace is exhausted during simulation: truncate episode, switch to next trace, or drop current video and truncate.",
+    )
     p.add_argument("--trace_ids_file", type=str, default="splits/fcc_train_trace_ids.txt")
     p.add_argument("--k_hist", type=int, default=8)
-    p.add_argument("--lambda_waste", type=float, default=1.0)
-    p.add_argument("--r_min_mbps", type=float, default=0.2, help="QoE log utility reference bitrate (Mbps).")
-    p.add_argument("--rebuf_penalty", type=float, default=2.66, help="QoE rebuffering penalty coefficient (paper-style).")
-    p.add_argument("--switch_penalty", type=float, default=1.0, help="QoE bitrate switching penalty coefficient.")
+    p.add_argument("--lambda_waste", type=float, default=0.5)
+    p.add_argument(
+        "--waste_saturate_k",
+        type=float,
+        default=1.0,
+        help="Waste penalty soft-saturation strength k in waste_ratio = 1 - exp(-k * raw), raw=waste_mbit/max(downloaded_mbit,eps).",
+    )
+    p.add_argument("--r_min_mbps", type=float, default=0.35, help="QoE log utility reference bitrate (Mbps).")
+    p.add_argument("--rebuf_penalty", type=float, default=1.0, help="QoE rebuffering penalty coefficient (paper-style).")
+    p.add_argument("--switch_penalty", type=float, default=0.1, help="QoE bitrate switching penalty coefficient.")
+    p.add_argument("--qoe_alpha", type=float, default=1.0, help="QoE bitrate log utility scaling alpha (paper: 1).")
+    p.add_argument(
+        "--switch_penalty_mode",
+        type=str,
+        default="log",
+        choices=["log", "abs"],
+        help="Switch penalty mode: 'log' uses abs(log(prev)-log(cur)); 'abs' uses abs(prev_bitrate-cur_bitrate) (paper).",
+    )
     p.add_argument(
         "--no_qoe_scale_by_watch_frac",
         action="store_true",
@@ -405,7 +544,7 @@ def main():
     p.add_argument(
         "--max_rebuf_s_per_video",
         type=float,
-        default=8.0,
+        default=0.0,
         help="User patience cap (seconds) within a single video. Set <=0 for 'infinite patience' (effectively disables swipe due to rebuffer).",
     )
     p.add_argument(
@@ -421,20 +560,25 @@ def main():
     p.add_argument(
         "--bitrates_mbps",
         type=str,
-        default="0.35,0.7,1.2,2.5,5.0",
-        help="Comma-separated bitrate ladder in Mbps. Default matches [180p,360p,480p,720p,1080p].",
+        default="0.35,0.6,0.9,1.2,1.8,2.5,4.0",
+        help="Comma-separated bitrate ladder in Mbps. Default matches [180p,270p,360p,480p,720p,1080p,1440p].",
     )
     p.add_argument(
         "--bitrate_labels",
         type=str,
-        default="180p,360p,480p,720p,1080p",
+        default="180p,270p,360p,480p,720p,1080p,1440p",
         help="Comma-separated labels aligned with --bitrates_mbps.",
     )
     p.add_argument(
         "--prefetch_thresholds",
         type=str,
-        default="1,2,4,6,8,12,18,24,30,36",
+        default="1,3,6,10,16,30",
         help="Comma-separated prefetch thresholds in seconds for joint action space (bitrate x thresholds).",
+    )
+    p.add_argument(
+        "--enable_future_prefetch",
+        action="store_true",
+        help="Enable cross-video prefetch: after CURRENT video is fully downloaded, use remaining capacity to prefetch FUTURE videos up to the same prefetch threshold. Default is disabled.",
     )
 
     # periodic in-distribution eval (FCC val)
@@ -555,13 +699,23 @@ def main():
         "max_events": int(args.max_events),
         "weight_by_views": (not bool(args.no_weight_by_views)),
         "traces_csv": args.traces_csv,
+        "trace_id_col": str(args.trace_id_col),
+        "trace_time_col": str(args.trace_time_col),
+        "trace_bw_col": str(args.trace_bw_col),
+        "trace_bw_multiplier": float(args.trace_bw_multiplier),
+        "trace_fill_mode": str(args.trace_fill_mode),
+        "trace_exhaust_mode": str(args.trace_exhaust_mode),
         "allowed_trace_ids": allowed_trace_ids,
         "k_hist": int(args.k_hist),
         "r_min_mbps": float(args.r_min_mbps),
         "rebuf_penalty": float(args.rebuf_penalty),
         "switch_penalty": float(args.switch_penalty),
+        "qoe_alpha": float(args.qoe_alpha),
+        "switch_penalty_mode": str(args.switch_penalty_mode),
         "qoe_scale_by_watch_frac": (not bool(args.no_qoe_scale_by_watch_frac)),
         "lambda_waste": float(args.lambda_waste),
+        "waste_saturate_k": float(args.waste_saturate_k),
+        "allow_future_prefetch": bool(args.enable_future_prefetch),
         "max_rebuf_s_per_video": (1e18 if float(args.max_rebuf_s_per_video) <= 0 else float(args.max_rebuf_s_per_video)),
         "rebuf_penalty_mode": str(args.rebuf_penalty_mode),
         "rebuf_cap_s": float(args.rebuf_cap_s),
@@ -569,11 +723,12 @@ def main():
         "prefetch_thresholds_s": thresholds,
         "video_bitrates_mbps": bitrates,
         "video_bitrate_labels": labels,
+        "debug_checks": bool(args.debug_numerics),
     })
 
     obs_dim = int(env.observation_space.shape[0])
     act_dim = int(env.action_space.n)
-    model = ActorCritic(obs_dim, act_dim).to(device)
+    model = ActorCritic(obs_dim, act_dim, logits_clip=float(args.logits_clip)).to(device)
     opt = optim.Adam(model.parameters(), lr=float(args.lr))
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -681,13 +836,23 @@ def main():
             "max_events": int(args.max_events),
             "weight_by_views": (not bool(args.no_weight_by_views)),
             "traces_csv": args.traces_csv,
+            "trace_id_col": str(args.trace_id_col),
+            "trace_time_col": str(args.trace_time_col),
+            "trace_bw_col": str(args.trace_bw_col),
+            "trace_bw_multiplier": float(args.trace_bw_multiplier),
+            "trace_fill_mode": str(args.trace_fill_mode),
+            "trace_exhaust_mode": str(args.trace_exhaust_mode),
             "allowed_trace_ids": [str(x) for x in eval_ids],
             "k_hist": int(args.k_hist),
             "r_min_mbps": float(args.r_min_mbps),
             "rebuf_penalty": float(args.rebuf_penalty),
             "switch_penalty": float(args.switch_penalty),
+            "qoe_alpha": float(args.qoe_alpha),
+            "switch_penalty_mode": str(args.switch_penalty_mode),
             "qoe_scale_by_watch_frac": (not bool(args.no_qoe_scale_by_watch_frac)),
             "lambda_waste": float(args.lambda_waste),
+            "waste_saturate_k": float(args.waste_saturate_k),
+            "allow_future_prefetch": bool(args.enable_future_prefetch),
             "max_rebuf_s_per_video": (1e18 if float(args.max_rebuf_s_per_video) <= 0 else float(args.max_rebuf_s_per_video)),
             "rebuf_penalty_mode": str(args.rebuf_penalty_mode),
             "rebuf_cap_s": float(args.rebuf_cap_s),
@@ -695,10 +860,15 @@ def main():
             "prefetch_thresholds_s": thresholds,
             "video_bitrates_mbps": bitrates,
             "video_bitrate_labels": labels,
+            "debug_checks": bool(args.debug_numerics),
         })
 
+    # IMPORTANT: avoid mixing multiple fresh runs into the same CSVs.
+    # If --resume is NOT set, we overwrite existing logs for this run_name.
+    file_mode = "a" if bool(args.resume) else "w"
+
     # Per-episode training log
-    with open(log_path, "a", newline="") as ep_f:
+    with open(log_path, file_mode, newline="") as ep_f:
         ep_w = csv.writer(ep_f)
         if ep_f.tell() == 0:
             ep_w.writerow([
@@ -709,7 +879,7 @@ def main():
             ])
 
         # Per-update summary
-        upd_f = open(updates_path, "a", newline="")
+        upd_f = open(updates_path, file_mode, newline="")
         upd_w = csv.writer(upd_f)
         if upd_f.tell() == 0:
             upd_w.writerow([
@@ -721,7 +891,7 @@ def main():
             ])
 
         # eval csv
-        eval_f = open(eval_path, "a", newline="")
+        eval_f = open(eval_path, file_mode, newline="")
         eval_w = csv.writer(eval_f)
         if eval_f.tell() == 0:
             eval_w.writerow([
@@ -729,17 +899,19 @@ def main():
                 "ep_return_mean", "ep_len_mean",
                 "return_per_step", "rebuf_s_per_step", "waste_s_per_step",
                 "downloaded_mbit_per_step", "waste_mbit_per_step",
+                "waste_raw_mean", "waste_raw_p50", "waste_raw_p90",
+                "waste_ratio_mean", "waste_ratio_p50", "waste_ratio_p90",
                 "early_stop_metric", "early_stop_best", "early_stop_bad_evals",
             ])
 
         # loss csv
-        loss_f = open(loss_path, "a", newline="")
+        loss_f = open(loss_path, file_mode, newline="")
         loss_w = csv.writer(loss_f)
         if loss_f.tell() == 0:
             loss_w.writerow(["global_steps", "update", "policy_loss", "value_loss", "entropy", "total_loss", "approx_kl", "clip_frac"])
 
         # action histogram csv (to detect policy collapse)
-        act_f = open(action_hist_path, "a", newline="")
+        act_f = open(action_hist_path, file_mode, newline="")
         act_w = csv.writer(act_f)
         if act_f.tell() == 0:
             act_dim_i = int(env.action_space.n)
@@ -761,6 +933,7 @@ def main():
                 int(args.rollout_steps),
                 global_steps_before=int(global_steps),
                 update_idx=int(update + 1),
+                action_mode=str(args.rollout_action_mode),
             )
             global_steps += int(args.rollout_steps)
             update += 1
@@ -773,6 +946,15 @@ def main():
             adv_t = torch.as_tensor(adv_np, dtype=torch.float32, device=device)
             ret_t = torch.as_tensor(ret_np, dtype=torch.float32, device=device)
 
+            ent_coef_now = float(args.ent_coef)
+            if args.ent_coef_end is not None and int(getattr(args, "ent_anneal_steps", 0)) > 0:
+                end = float(args.ent_coef_end)
+                steps = float(max(1, int(args.ent_anneal_steps)))
+                frac = float(np.clip(float(global_steps) / steps, 0.0, 1.0))
+                ent_coef_now = float(ent_coef_now + frac * (end - ent_coef_now))
+            if args.ent_coef_min is not None:
+                ent_coef_now = float(max(ent_coef_now, float(args.ent_coef_min)))
+
             loss_stats = ppo_update(
                 model,
                 opt,
@@ -783,10 +965,12 @@ def main():
                 ret_t,
                 clip_ratio=float(args.clip_ratio),
                 vf_coef=float(args.vf_coef),
-                ent_coef=float(args.ent_coef),
+                ent_coef=float(ent_coef_now),
+                uniform_kl_coef=float(args.uniform_kl_coef),
                 target_kl=(None if float(args.target_kl) <= 0 else float(args.target_kl)),
                 train_iters=int(args.train_iters),
                 batch_size=int(args.batch_size),
+                debug_numerics=bool(args.debug_numerics),
             )
 
             t_up1 = time.time()
@@ -928,6 +1112,12 @@ def main():
                     ev.get("waste_s_per_step"),
                     ev.get("downloaded_mbit_per_step"),
                     ev.get("waste_mbit_per_step"),
+                    ev.get("waste_raw_mean"),
+                    ev.get("waste_raw_p50"),
+                    ev.get("waste_raw_p90"),
+                    ev.get("waste_ratio_mean"),
+                    ev.get("waste_ratio_p50"),
+                    ev.get("waste_ratio_p90"),
                     metric_name,
                     best_metric,
                     bad_evals,
@@ -937,7 +1127,9 @@ def main():
                     f"[Eval@FCC] update={update} step={global_steps} "
                     f"return/step={ev.get('return_per_step'):.4f} "
                     f"rebuf_s/step={ev.get('rebuf_s_per_step'):.4f} "
-                    f"waste_mbit/step={ev.get('waste_mbit_per_step'):.4f}"
+                    f"waste_mbit/step={ev.get('waste_mbit_per_step'):.4f} "
+                    f"raw(p50/p90)={ev.get('waste_raw_p50'):.3f}/{ev.get('waste_raw_p90'):.3f} "
+                    f"wz(p50/p90)={ev.get('waste_ratio_p50'):.3f}/{ev.get('waste_ratio_p90'):.3f}"
                 )
 
                 # Convergence detection: stability of rolling mean/std on FCC-val.
