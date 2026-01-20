@@ -416,6 +416,9 @@ class DUASVSEnv(gym.Env):
         # Whether to allow cross-video prefetch (download FUTURE videos after CURRENT is fully downloaded).
         # Default: disabled.
         self.allow_future_prefetch: bool = bool(config.get("allow_future_prefetch", False))
+        # Debug/experiment switch: ensure there is NO cross-video-prefetch carry-in (and thus no discard-prefetch waste).
+        # If enabled and we ever see non-zero discard_prefetch waste, raise immediately.
+        self.strict_no_prefetch_discard: bool = bool(config.get("strict_no_prefetch_discard", False))
 
         # RNG
         self._rng = np.random.default_rng(int(config.get("seed", 0)))
@@ -668,27 +671,29 @@ class DUASVSEnv(gym.Env):
                         delta_s -= add_cur
 
                     # Then, if still have capacity, prefetch FUTURE videos sequentially (A: use current bitrate).
-                    j = int(self.i) + 1
-                    while delta_s > 1e-12 and j < len(self.session):
-                        if self.prefetched_unplayed_s[j] > 0.0 and self.prefetched_bitrate_idx[j] != int(self.prev_bitrate_idx) and self.prefetched_bitrate_idx[j] != -1:
-                            # Discard old prefetch and replace with current bitrate's prefetch.
-                            ws, wm = self._discard_prefetch_as_waste(j)
-                            self.sum_waste_s += float(ws)
-                            self.sum_waste_mbit += float(wm)
+                    # IMPORTANT: only do this when allow_future_prefetch=True.
+                    if bool(self.allow_future_prefetch) and (delta_s > 1e-12):
+                        j = int(self.i) + 1
+                        while delta_s > 1e-12 and j < len(self.session):
+                            if self.prefetched_unplayed_s[j] > 0.0 and self.prefetched_bitrate_idx[j] != int(self.prev_bitrate_idx) and self.prefetched_bitrate_idx[j] != -1:
+                                # Discard old prefetch and replace with current bitrate's prefetch.
+                                ws, wm = self._discard_prefetch_as_waste(j)
+                                self.sum_waste_s += float(ws)
+                                self.sum_waste_mbit += float(wm)
 
-                        if self.prefetched_bitrate_idx[j] == -1:
-                            self.prefetched_bitrate_idx[j] = int(self.prev_bitrate_idx)
+                            if self.prefetched_bitrate_idx[j] == -1:
+                                self.prefetched_bitrate_idx[j] = int(self.prev_bitrate_idx)
 
-                        rem_j = float(max(0.0, float(self.session[j].video_len_s) - float(self.prefetched_unplayed_s[j])))
-                        if rem_j <= 0.0:
-                            j += 1
-                            continue
-                        add_j = float(min(rem_j, delta_s))
-                        self.prefetched_unplayed_s[j] = float(self.prefetched_unplayed_s[j] + add_j)
-                        downloaded_future_new += add_j
-                        delta_s -= add_j
-                        if self.prefetched_unplayed_s[j] >= float(self.session[j].video_len_s) - 1e-9:
-                            j += 1
+                            rem_j = float(max(0.0, float(self.session[j].video_len_s) - float(self.prefetched_unplayed_s[j])))
+                            if rem_j <= 0.0:
+                                j += 1
+                                continue
+                            add_j = float(min(rem_j, delta_s))
+                            self.prefetched_unplayed_s[j] = float(self.prefetched_unplayed_s[j] + add_j)
+                            downloaded_future_new += add_j
+                            delta_s -= add_j
+                            if self.prefetched_unplayed_s[j] >= float(self.session[j].video_len_s) - 1e-9:
+                                j += 1
 
                 dl_time_s += 1.0
 
@@ -771,6 +776,11 @@ class DUASVSEnv(gym.Env):
                 step_discard_waste_mbit += float(wm)
                 self.sum_waste_s += float(ws)
                 self.sum_waste_mbit += float(wm)
+        if bool(self.strict_no_prefetch_discard) and float(step_discard_waste_mbit) > 1e-9:
+            raise RuntimeError(
+                f"strict_no_prefetch_discard=True but discarded prefetched content occurred: "
+                f"step_discard_waste_mbit={step_discard_waste_mbit:.6g} at video_idx={self.i}"
+            )
         # Switching penalty needs the previous video's bitrate; prefetch (A) uses the current decision bitrate.
         prev_idx_for_switch = int(self.prev_bitrate_idx)
         self.prev_bitrate_idx = int(bitrate_idx)
@@ -827,7 +837,9 @@ class DUASVSEnv(gym.Env):
         # Data volume proxy under CBR assumption:
         #   video_size_mbit = bitrate_mbps * seconds
         downloaded_mbit = float(bitrate_mbps * float(dl_cur_new_s + dl_future_new_s))
-        waste_mbit = float(bitrate_mbps * float(waste_cur_s)) + float(step_discard_waste_mbit)
+        waste_mbit_unwatched = float(bitrate_mbps * float(waste_cur_s))
+        waste_mbit_discard_prefetch = float(step_discard_waste_mbit)
+        waste_mbit = float(waste_mbit_unwatched + waste_mbit_discard_prefetch)
         self.sum_downloaded_mbit += float(downloaded_mbit)
         self.sum_waste_mbit += float(waste_mbit)
 
@@ -870,6 +882,10 @@ class DUASVSEnv(gym.Env):
         k = float(max(1e-9, float(self.waste_saturate_k)))
         # Soft saturating in [0, 1): avoids hard clipping while still bounding the penalty.
         waste_ratio = float(1.0 - np.exp(-k * raw))
+        # A more interpretable bounded waste fraction for diagnostics (NOT used in reward):
+        # waste_frac \in [0, 1] by construction.
+        denom2 = float(max(downloaded_mbit + waste_mbit, 1e-9))
+        waste_frac = float(np.clip(waste_mbit / denom2, 0.0, 1.0))
         reward = float(qoe - self.lambda_waste * waste_ratio)
 
         self.i += 1
@@ -920,11 +936,14 @@ class DUASVSEnv(gym.Env):
             "swiped_due_to_rebuf": bool(swiped_due_to_rebuf),
             "downloaded_mbit": float(downloaded_mbit),
             "waste_mbit": float(waste_mbit),
+            "waste_mbit_unwatched": float(waste_mbit_unwatched),
+            "waste_mbit_discard_prefetch": float(waste_mbit_discard_prefetch),
             # For debugging / eval diagnostics of waste shaping:
             # raw = waste_mbit / max(downloaded_mbit, eps)
             # waste_ratio = 1 - exp(-k * raw)   (soft saturating)
             "waste_raw": float(raw),
             "waste_ratio": float(waste_ratio),
+            "waste_frac": float(waste_frac),
             "sum_rebuf_s": float(self.sum_rebuf_s),
             "sum_waste_s": float(self.sum_waste_s),
             "sum_qoe": float(self.sum_qoe),

@@ -125,6 +125,7 @@ def ppo_update(
     train_iters: int,
     batch_size: int,
     debug_numerics: bool = False,
+    disable_backward: bool = False,
 ):
     n = obs.shape[0]
     stats_sum = {
@@ -176,15 +177,16 @@ def ppo_update(
             stats_sum["clip_frac"] += float(clip_frac.detach().cpu().item())
             stats_cnt += 1
 
-            opt.zero_grad()
-            loss.backward()
-            if bool(debug_numerics):
-                for p in model.parameters():
-                    if p.grad is None:
-                        continue
-                    if not torch.isfinite(p.grad).all():
-                        raise FloatingPointError("Non-finite gradients detected.")
-            opt.step()
+            if not bool(disable_backward):
+                opt.zero_grad()
+                loss.backward()
+                if bool(debug_numerics):
+                    for p in model.parameters():
+                        if p.grad is None:
+                            continue
+                        if not torch.isfinite(p.grad).all():
+                            raise FloatingPointError("Non-finite gradients detected.")
+                opt.step()
 
             # Target-KL early stop to reduce policy drift / oscillation.
             if (target_kl is not None) and np.isfinite(float(target_kl)) and float(target_kl) > 0.0:
@@ -244,6 +246,7 @@ def eval_on_traces(
     # Per-step diagnostic distributions (across all eval steps).
     waste_raw_steps: List[float] = []
     waste_ratio_steps: List[float] = []
+    waste_frac_steps: List[float] = []
 
     # Key perf optimization:
     # Reuse a single env across all trace_ids to avoid repeatedly parsing large FCC CSVs.
@@ -271,10 +274,13 @@ def eval_on_traces(
             if isinstance(last_info, dict):
                 wr = last_info.get("waste_raw", None)
                 wz = last_info.get("waste_ratio", None)
+                wf = last_info.get("waste_frac", None)
                 if wr is not None and np.isfinite(float(wr)):
                     waste_raw_steps.append(float(wr))
                 if wz is not None and np.isfinite(float(wz)):
                     waste_ratio_steps.append(float(wz))
+                if wf is not None and np.isfinite(float(wf)):
+                    waste_frac_steps.append(float(wf))
         ep_returns.append(float(ep_ret))
         ep_lens.append(int(ep_len))
         if isinstance(last_info, dict):
@@ -304,6 +310,8 @@ def eval_on_traces(
 
     raw_s = _stats(waste_raw_steps)
     ratio_s = _stats(waste_ratio_steps)
+    frac_s = _stats(waste_frac_steps)
+    sat_frac = float(np.mean([1.0 if (x >= 0.99) else 0.0 for x in waste_ratio_steps])) if waste_ratio_steps else float("nan")
 
     return {
         "n_eps": float(len(ep_returns)),
@@ -321,6 +329,10 @@ def eval_on_traces(
         "waste_ratio_mean": ratio_s["mean"],
         "waste_ratio_p50": ratio_s["p50"],
         "waste_ratio_p90": ratio_s["p90"],
+        "waste_frac_mean": frac_s["mean"],
+        "waste_frac_p50": frac_s["p50"],
+        "waste_frac_p90": frac_s["p90"],
+        "waste_ratio_sat_frac": sat_frac,
     }
 
 
@@ -493,6 +505,11 @@ def main():
         help="Action selection for rollout collection.",
     )
     p.add_argument("--debug_numerics", action="store_true", help="Enable strict finite checks for env obs/reward and PPO tensors (raises on NaN/inf).")
+    p.add_argument(
+        "--disable_backward",
+        action="store_true",
+        help="If set, skip loss.backward() and optimizer.step(). Useful to verify that learning is actually happening (weights won't update).",
+    )
 
     # env/data
     p.add_argument("--events_csv", type=str, default="data/big_matrix_valid_video.csv")
@@ -580,12 +597,25 @@ def main():
         action="store_true",
         help="Enable cross-video prefetch: after CURRENT video is fully downloaded, use remaining capacity to prefetch FUTURE videos up to the same prefetch threshold. Default is disabled.",
     )
+    p.add_argument(
+        "--strict_no_prefetch_discard",
+        action="store_true",
+        help="If set, env will raise if it ever needs to discard prefetched content due to bitrate mismatch. "
+             "Use this to validate the 'no prefetch before entering video' experiment.",
+    )
 
     # periodic in-distribution eval (FCC val)
     p.add_argument("--eval_every_updates", type=int, default=5)
     p.add_argument("--eval_ids_file", type=str, default="splits/fcc_val_trace_ids.txt")
     p.add_argument("--eval_n_traces", type=int, default=20)
     p.add_argument("--eval_max_videos", type=int, default=200)
+    p.add_argument(
+        "--eval_seed",
+        type=int,
+        default=1000,
+        help="Fixed seed controlling eval session sampling (used with trace_id to derive session_seed). "
+             "Keeping this constant makes eval curves comparable across updates (especially useful with --disable_backward).",
+    )
     p.add_argument(
         "--eval_select_mode",
         type=str,
@@ -657,6 +687,7 @@ def main():
 
     set_seed(int(args.seed))
     device = torch.device(args.device)
+    print(f"[Config] disable_backward={bool(getattr(args, 'disable_backward', False))}")
 
     # --- mode presets ---
     # User requirement: official training validates every 4096 steps using 50 FCC-val traces.
@@ -716,6 +747,7 @@ def main():
         "lambda_waste": float(args.lambda_waste),
         "waste_saturate_k": float(args.waste_saturate_k),
         "allow_future_prefetch": bool(args.enable_future_prefetch),
+        "strict_no_prefetch_discard": bool(args.strict_no_prefetch_discard),
         "max_rebuf_s_per_video": (1e18 if float(args.max_rebuf_s_per_video) <= 0 else float(args.max_rebuf_s_per_video)),
         "rebuf_penalty_mode": str(args.rebuf_penalty_mode),
         "rebuf_cap_s": float(args.rebuf_cap_s),
@@ -756,6 +788,14 @@ def main():
             if bool(args.resume) and "optimizer" in ck:
                 try:
                     opt.load_state_dict(ck["optimizer"])
+                    # IMPORTANT: if resuming, optimizer state_dict may overwrite the LR.
+                    # Allow overriding LR via current CLI --lr for controlled fine-tuning.
+                    try:
+                        for pg in opt.param_groups:
+                            pg["lr"] = float(args.lr)
+                        print(f"[Resume] Overrode optimizer lr to {float(args.lr):g}")
+                    except Exception as e:
+                        print(f"[Resume] WARNING: failed to override optimizer lr: {e}")
                 except Exception as e:
                     print(f"[Resume] WARNING: failed to load optimizer state: {e}")
             if bool(args.resume):
@@ -853,6 +893,7 @@ def main():
             "lambda_waste": float(args.lambda_waste),
             "waste_saturate_k": float(args.waste_saturate_k),
             "allow_future_prefetch": bool(args.enable_future_prefetch),
+            "strict_no_prefetch_discard": bool(args.strict_no_prefetch_discard),
             "max_rebuf_s_per_video": (1e18 if float(args.max_rebuf_s_per_video) <= 0 else float(args.max_rebuf_s_per_video)),
             "rebuf_penalty_mode": str(args.rebuf_penalty_mode),
             "rebuf_cap_s": float(args.rebuf_cap_s),
@@ -901,6 +942,8 @@ def main():
                 "downloaded_mbit_per_step", "waste_mbit_per_step",
                 "waste_raw_mean", "waste_raw_p50", "waste_raw_p90",
                 "waste_ratio_mean", "waste_ratio_p50", "waste_ratio_p90",
+                "waste_frac_mean", "waste_frac_p50", "waste_frac_p90",
+                "waste_ratio_sat_frac",
                 "early_stop_metric", "early_stop_best", "early_stop_bad_evals",
             ])
 
@@ -971,6 +1014,7 @@ def main():
                 train_iters=int(args.train_iters),
                 batch_size=int(args.batch_size),
                 debug_numerics=bool(args.debug_numerics),
+                disable_backward=bool(getattr(args, "disable_backward", False)),
             )
 
             t_up1 = time.time()
@@ -1057,7 +1101,8 @@ def main():
 
             # periodic deterministic eval on fixed FCC val traces
             if eval_ids and int(args.eval_every_updates) > 0 and (update % int(args.eval_every_updates) == 0):
-                eval_seed = int(1000 + update)
+                # IMPORTANT: keep eval_seed fixed by default so eval is comparable across updates.
+                eval_seed = int(getattr(args, "eval_seed", 1000))
                 ev = eval_on_traces(
                     model=model,
                     device=device,
@@ -1118,6 +1163,10 @@ def main():
                     ev.get("waste_ratio_mean"),
                     ev.get("waste_ratio_p50"),
                     ev.get("waste_ratio_p90"),
+                    ev.get("waste_frac_mean"),
+                    ev.get("waste_frac_p50"),
+                    ev.get("waste_frac_p90"),
+                    ev.get("waste_ratio_sat_frac"),
                     metric_name,
                     best_metric,
                     bad_evals,
@@ -1129,7 +1178,9 @@ def main():
                     f"rebuf_s/step={ev.get('rebuf_s_per_step'):.4f} "
                     f"waste_mbit/step={ev.get('waste_mbit_per_step'):.4f} "
                     f"raw(p50/p90)={ev.get('waste_raw_p50'):.3f}/{ev.get('waste_raw_p90'):.3f} "
-                    f"wz(p50/p90)={ev.get('waste_ratio_p50'):.3f}/{ev.get('waste_ratio_p90'):.3f}"
+                    f"wz(p50/p90)={ev.get('waste_ratio_p50'):.3f}/{ev.get('waste_ratio_p90'):.3f} "
+                    f"wfrac(p50/p90)={ev.get('waste_frac_p50'):.3f}/{ev.get('waste_frac_p90'):.3f} "
+                    f"wz_sat={ev.get('waste_ratio_sat_frac'):.2f}"
                 )
 
                 # Convergence detection: stability of rolling mean/std on FCC-val.

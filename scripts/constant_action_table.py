@@ -142,6 +142,12 @@ def main() -> None:
     p.add_argument("--waste_saturate_k", type=float, default=1.0)
     p.add_argument("--max_rebuf_s_per_video", type=float, default=0.0)
     p.add_argument("--enable_future_prefetch", action="store_true")
+    p.add_argument(
+        "--strict_no_prefetch_discard",
+        action="store_true",
+        help="If set, env will raise if it ever discards prefetched content due to bitrate mismatch. "
+             "Use to validate 'no future prefetch' baselines.",
+    )
 
     p.add_argument("--bitrates_mbps", type=str, default="0.35,0.6,0.9,1.2,1.8,2.5,4.0")
     p.add_argument("--bitrate_labels", type=str, default="180p,270p,360p,480p,720p,1080p,1440p")
@@ -193,6 +199,7 @@ def main() -> None:
         "lambda_waste": float(args.lambda_waste),
         "waste_saturate_k": float(args.waste_saturate_k),
         "allow_future_prefetch": bool(args.enable_future_prefetch),
+        "strict_no_prefetch_discard": bool(args.strict_no_prefetch_discard),
         "max_rebuf_s_per_video": (1e18 if float(args.max_rebuf_s_per_video) <= 0 else float(args.max_rebuf_s_per_video)),
         "prefetch_thresholds_s": thresholds,
         "video_bitrates_mbps": bitrates,
